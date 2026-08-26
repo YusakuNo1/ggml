@@ -2016,7 +2016,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
 
-    const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
+    // A scheduler with one backend cannot split the graph across backends: the
+    // entire graph is a single split. Reserving one split per possible graph
+    // node in that case is both unnecessary and especially harmful for large
+    // TTS schedulers (for example Kokoro uses a 256k-node upper bound, which
+    // previously requested about 6 GiB of scheduler metadata on iOS).
+    const size_t ggml_sched_max_splits = n_backends == 1 ? 1 : graph_size;
     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
     sched->node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
     sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
