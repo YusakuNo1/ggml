@@ -487,6 +487,7 @@ if (MSVC)
 
         configure_msvc_target(simple-ctx)
         configure_msvc_target(simple-backend)
+        configure_msvc_target(single-backend-scheduler)
     endif()
 
     if (GGML_BUILD_TESTS)

@@ -12,6 +12,17 @@ set(TEST_TARGET simple-backend)
 add_executable(${TEST_TARGET} simple-backend.cpp)
 target_link_libraries(${TEST_TARGET} PRIVATE ggml)
 
+#
+# single-backend-scheduler
+
+set(TEST_TARGET single-backend-scheduler)
+add_executable(${TEST_TARGET} single-backend-scheduler.cpp)
+target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+
+if (WIN32)
+    target_link_libraries(${TEST_TARGET} PRIVATE Psapi)
+endif()
+
 if (GGML_CUDA)
     add_compile_definitions(GGML_USE_CUDA)
 endif()
