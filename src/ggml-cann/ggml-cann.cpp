@@ -794,9 +794,36 @@ struct TensorSetTracker {
  * This structure holds information about a CANN buffer, including the device
  * ID, device pointer, and a name derived from GGML_CANN_NAME and the device ID.
  */
+static std::atomic<uint64_t> g_nz_cache_epoch[GGML_CANN_MAX_DEVICES]{};
+
+struct ggml_cann_nz_cache {
+    void* data = nullptr;
+    size_t size = 0;
+    bool ready = false;
+    bool initialized = false;
+    uint64_t selections = 0; // Host matmul encodes selecting this NZ pointer, not device executions.
+    ggml_type type = GGML_TYPE_F32;
+    int64_t ne0 = 0, ne1 = 0;
+    ggml_cann_upload_coverage written;
+    ~ggml_cann_nz_cache() {
+        if (data)
+            ACL_CHECK(aclrtFree(data));
+    }
+};
+
+bool ggml_cann_nz_cache_enabled() {
+    static const bool enabled = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ_CACHE").value_or("off"));
+    return enabled;
+}
+
 struct ggml_backend_cann_buffer_context {
     int32_t device;             ///< The device ID associated with this buffer context.
     void *  dev_ptr = nullptr;  ///< Pointer to the device memory allocated for the buffer.
+
+    // Cache owns a separate NZ representation. tensor->data ALWAYS remains ND
+    // in cache mode, including generic readback, scheduler copies and gathers.
+    std::mutex nz_mutex;
+    std::unordered_map<void*, std::unique_ptr<ggml_cann_nz_cache>> nz;
 
     std::mutex tracker_mutex;   ///< Protects the trackers map
     std::unordered_map<void *, std::unique_ptr<TensorSetTracker>> trackers;
@@ -812,7 +839,13 @@ struct ggml_backend_cann_buffer_context {
     /**
      * @brief Destructor to free the device memory allocated for the buffer.
      */
-    ~ggml_backend_cann_buffer_context() { ACL_CHECK(aclrtFree(dev_ptr)); }
+    ~ggml_backend_cann_buffer_context() {
+        ggml_cann_set_device(device);
+        if (!nz.empty())
+            ++g_nz_cache_epoch[device];
+        nz.clear();
+        ACL_CHECK(aclrtFree(dev_ptr));
+    }
 
     /**
      * @brief Get or create a tracker for the given tensor.
@@ -1252,6 +1285,142 @@ static void weight_format_to_nz(ggml_tensor * tensor, int device) {
     void * g_nz_workspace = g_nz_workspaces[device].get();
 
     ACL_CHECK(aclnnTransMatmulWeight(g_nz_workspace, workspaceSize, executor, nullptr));
+    // The cache will be consumed on a compute stream (possibly captured),
+    // while conversion runs on the default stream. Publish readiness only
+    // after conversion completes, and keep its workspace locked until then.
+    if (ggml_cann_nz_cache_enabled()) {
+        ACL_CHECK(aclrtSynchronizeDevice());
+    }
+}
+
+// Serialize chunk uploads and merge byte ranges: overlapping/out-of-order writes
+// cannot declare a cache ready while holes remain. After initial upload, partial
+// synchronous updates rebuild from the complete ND representation.
+static bool ggml_cann_set_cached_weight(ggml_backend_cann_buffer_context* ctx, ggml_tensor* tensor, const void* data,
+                                        size_t offset, size_t size) {
+    static const bool enabled = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
+    if (!ggml_cann_nz_cache_enabled() || !enabled || !ggml_cann_nz_candidate(tensor))
+        return false;
+    if (size == 0)
+        return true;
+    std::lock_guard<std::mutex> lock(ctx->nz_mutex);
+    auto& entry = ctx->nz[tensor->data];
+    if (!entry || entry->type != tensor->type || entry->ne0 != tensor->ne[0] || entry->ne1 != tensor->ne[1]) {
+        if (entry && entry->data)
+            ++g_nz_cache_epoch[ctx->device];
+        entry = std::make_unique<ggml_cann_nz_cache>();
+        entry->type = tensor->type;
+        entry->ne0 = tensor->ne[0];
+        entry->ne1 = tensor->ne[1];
+    }
+    auto& cache = *entry;
+    if (cache.ready)
+        ++g_nz_cache_epoch[ctx->device];
+    cache.ready = false;
+    ACL_CHECK(aclrtMemcpy((char*)tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
+    if (size == 0)
+        return true;
+    const size_t bytes = ggml_nbytes(tensor);
+    const bool complete = cache.written.add(offset, size, bytes);
+    if (!cache.initialized && !complete)
+        return true;
+    cache.initialized = true;
+    cache.written.clear();
+    if (!cache.data) {
+        int64_t shape[] = {tensor->ne[1], tensor->ne[0]};
+        const aclIntArray* acl_shape = aclCreateIntArray(shape, 2);
+        ACL_CHECK(aclnnCalculateMatmulWeightSizeV2(acl_shape, ggml_cann_type_mapping(tensor->type), &cache.size));
+        ACL_CHECK(aclDestroyIntArray(acl_shape));
+        cache.size = std::max(cache.size, bytes);
+        // Optional optimization: allocation failure leaves a usable ND tensor.
+        if (aclrtMalloc(&cache.data, cache.size, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) {
+            cache.data = nullptr;
+            cache.size = 0;
+            return true;
+        }
+    }
+    ACL_CHECK(aclrtMemcpy(cache.data, cache.size, tensor->data, bytes, ACL_MEMCPY_DEVICE_TO_DEVICE));
+    ggml_tensor nz_tensor = *tensor;
+    nz_tensor.data = cache.data;
+    weight_format_to_nz(&nz_tensor, ctx->device);
+    cache.ready = true;
+    ++g_nz_cache_epoch[ctx->device];
+    return true;
+}
+
+// Returning a cache pointer never guesses layout from the tensor name. Views
+// use the ordinary ND bytes; lookup requires the exact uploaded shape/type.
+void* ggml_cann_cached_nz_weight(ggml_backend_cann_context& ctx, const ggml_tensor* weight) {
+    GGML_UNUSED(ctx);
+    if (!ggml_cann_nz_cache_enabled() || weight->view_src || !weight->buffer ||
+        !ggml_backend_buft_is_cann(weight->buffer->buft))
+        return nullptr;
+    auto* buffer = (ggml_backend_cann_buffer_context*)weight->buffer->context;
+    std::lock_guard<std::mutex> lock(buffer->nz_mutex);
+    auto it = buffer->nz.find(weight->data);
+    if (it == buffer->nz.end())
+        return nullptr;
+    auto& cache = *it->second;
+    if (cache.ready && cache.type == weight->type && cache.ne0 == weight->ne[0] && cache.ne1 == weight->ne[1]) {
+        ++cache.selections;
+        return cache.data;
+    }
+    return nullptr;
+}
+
+static size_t ggml_cann_nz_cache_size(const ggml_tensor* weight) {
+    if (!ggml_cann_nz_cache_enabled() || weight->view_src || !weight->buffer ||
+        !ggml_backend_buft_is_cann(weight->buffer->buft))
+        return 0;
+    auto* ctx = (ggml_backend_cann_buffer_context*)weight->buffer->context;
+    std::lock_guard<std::mutex> lock(ctx->nz_mutex);
+    auto it = ctx->nz.find(weight->data);
+    if (it == ctx->nz.end())
+        return 0;
+    const auto& c = *it->second;
+    return c.ready && c.type == weight->type && c.ne0 == weight->ne[0] && c.ne1 == weight->ne[1] ? c.size : 0;
+}
+
+static uint64_t ggml_cann_nz_cache_selections(const ggml_tensor* weight) {
+    if (!ggml_cann_nz_cache_enabled() || weight->view_src || !weight->buffer ||
+        !ggml_backend_buft_is_cann(weight->buffer->buft))
+        return 0;
+    auto* ctx = (ggml_backend_cann_buffer_context*)weight->buffer->context;
+    std::lock_guard<std::mutex> lock(ctx->nz_mutex);
+    auto it = ctx->nz.find(weight->data);
+    if (it == ctx->nz.end())
+        return 0;
+    const auto& c = *it->second;
+    return c.ready && c.type == weight->type && c.ne0 == weight->ne[0] && c.ne1 == weight->ne[1] ? c.selections : 0;
+}
+
+static uint64_t ggml_cann_graph_captures(ggml_backend_t backend) {
+    return ((ggml_backend_cann_context*)backend->context)->acl_captures;
+}
+
+static uint64_t ggml_cann_graph_replays(ggml_backend_t backend) {
+    return ((ggml_backend_cann_context*)backend->context)->acl_replays;
+}
+
+static void ggml_cann_invalidate_nz(ggml_backend_buffer_t buffer, const void* data = nullptr, size_t size = 0) {
+    if (!ggml_cann_nz_cache_enabled() || !buffer || !ggml_backend_buft_is_cann(buffer->buft) || (data && size == 0))
+        return;
+    auto* ctx = (ggml_backend_cann_buffer_context*)buffer->context;
+    std::lock_guard<std::mutex> lock(ctx->nz_mutex);
+    // Invalidate by byte range so writes through aliases are covered without
+    // discarding every earlier weight when a shared buffer receives a new one.
+    const uintptr_t first = (uintptr_t)data;
+    for (auto& entry : ctx->nz) {
+        const auto& c = *entry.second;
+        const uintptr_t start = (uintptr_t)entry.first;
+        const size_t bytes = ggml_row_size(c.type, c.ne0) * c.ne1;
+        if (!data || (first < start + bytes && start < first + size)) {
+            if (entry.second->ready)
+                ++g_nz_cache_epoch[ctx->device];
+            entry.second->ready = false;
+            entry.second->written.clear();
+        }
+    }
 }
 
 // TODO: need handle tensor which has paddings.
@@ -1285,9 +1454,13 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // Only check env once.
     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
 
+    if (ggml_cann_set_cached_weight(ctx, tensor, data, offset, size))
+        return;
+    ggml_cann_invalidate_nz(buffer, (char*)tensor->data + offset, size);
+
     bool is_quantized = need_transform(tensor->type);
-    bool is_nz        = !is_quantized && tensor->type != GGML_TYPE_BF16 && weight_to_nz &&
-                 is_matmul_weight((const ggml_tensor *) tensor);
+    bool is_nz = !ggml_cann_nz_cache_enabled() && !is_quantized && tensor->type != GGML_TYPE_BF16 && weight_to_nz &&
+                 is_matmul_weight((const ggml_tensor*)tensor);
 
     // Plain tensor (not quantized, not NZ): direct copy, no tracking needed
     if (!is_quantized && !is_nz) {
@@ -1398,6 +1571,7 @@ static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer,
 static bool ggml_backend_cann_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
                                                 const ggml_tensor *   src,
                                                 ggml_tensor *         dst) {
+    ggml_cann_invalidate_nz(buffer, dst->data, ggml_nbytes(dst));
     if (ggml_backend_buft_is_cann(src->buffer->buft)) {
         ggml_backend_cann_buffer_context * src_ctx = (ggml_backend_cann_buffer_context *) src->buffer->context;
         ggml_backend_cann_buffer_context * dst_ctx = (ggml_backend_cann_buffer_context *) buffer->context;
@@ -1441,6 +1615,7 @@ static void ggml_backend_cann_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
+    ggml_cann_invalidate_nz(buffer, (char*)tensor->data + offset, size);
     ACL_CHECK(aclrtMemset((char *) tensor->data + offset, size, value, size));
 }
 
@@ -1457,6 +1632,7 @@ static void ggml_backend_cann_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
+    ggml_cann_invalidate_nz(buffer);
     ACL_CHECK(aclrtMemset(ctx->dev_ptr, buffer->size, value, buffer->size));
 }
 
@@ -1563,8 +1739,8 @@ static size_t ggml_backend_cann_buffer_type_get_alloc_size(ggml_backend_buffer_t
         if (ne0 % MATRIX_ROW_PADDING != 0) {
             size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
         }
-    } else if (weight_to_nz && tensor->type != GGML_TYPE_BF16
-               && is_matmul_weight((const ggml_tensor *) tensor)) {
+    } else if (!ggml_cann_nz_cache_enabled() && weight_to_nz && tensor->type != GGML_TYPE_BF16 &&
+               is_matmul_weight((const ggml_tensor*)tensor)) {
         // NZ format weight are not support quantized yet.
         // If ND tensor transform to NZ, size may changed.
         int64_t shape[] = { tensor->ne[1], tensor->ne[0] };
@@ -1595,12 +1771,14 @@ static bool ggml_backend_cann_buffer_type_is_host(ggml_backend_buffer_type_t buf
  * memory for CANN buffer types in the GGML backend.
  */
 static const ggml_backend_buffer_type_i ggml_backend_cann_buffer_type_interface = {
-    /* .get_name         = */ ggml_backend_cann_buffer_type_name,
-    /* .alloc_buffer     = */ ggml_backend_cann_buffer_type_alloc_buffer,
-    /* .get_alignment    = */ ggml_backend_cann_buffer_type_get_alignment,
-    /* .get_max_size     = */ NULL,  // defaults to SIZE_MAX
-    /* .get_alloc_size   = */ ggml_backend_cann_buffer_type_get_alloc_size,
-    /* .is_host          = */ ggml_backend_cann_buffer_type_is_host,
+    /* .get_name            = */ ggml_backend_cann_buffer_type_name,
+    /* .alloc_buffer        = */ ggml_backend_cann_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n      = */ NULL,
+    /* .get_alignment       = */ ggml_backend_cann_buffer_type_get_alignment,
+    /* .get_max_size        = */ NULL,  // defaults to SIZE_MAX
+    /* .get_alloc_size      = */ ggml_backend_cann_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n    = */ NULL,
+    /* .is_host             = */ ggml_backend_cann_buffer_type_is_host,
 };
 
 /**
@@ -1742,12 +1920,14 @@ static ggml_backend_buffer_t ggml_backend_cann_host_buffer_type_alloc_buffer(ggm
 ggml_backend_buffer_type_t ggml_backend_cann_host_buffer_type() {
     static struct ggml_backend_buffer_type ggml_backend_cann_buffer_type_host = {
         /* .iface    = */ {
-                           /* .get_name         = */ ggml_backend_cann_host_buffer_type_name,
-                           /* .alloc_buffer     = */ ggml_backend_cann_host_buffer_type_alloc_buffer,
-                           /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
-                           /* .get_max_size     = */ NULL,  // defaults to SIZE_MAX
-            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
-                           /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+                           /* .get_name             = */ ggml_backend_cann_host_buffer_type_name,
+                           /* .alloc_buffer         = */ ggml_backend_cann_host_buffer_type_alloc_buffer,
+                           /* .alloc_buffer_n       = */ NULL,
+                           /* .get_alignment        = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+                           /* .get_max_size         = */ NULL,  // defaults to SIZE_MAX
+                           /* .get_alloc_size       = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                           /* .get_alloc_size_n     = */ NULL,
+                           /* .is_host              = */ ggml_backend_cpu_buffer_type()->iface.is_host,
                            },
         /* .device   = */
         ggml_backend_reg_dev_get(ggml_backend_cann_reg(), 0),
@@ -2087,6 +2267,7 @@ static void ggml_backend_cann_set_tensor_async(ggml_backend_t backend,
     GGML_ASSERT(buf->buft == ggml_backend_cann_buffer_type(cann_ctx->device) && "unsupported buffer type");
     GGML_ASSERT(!ggml_is_quantized(tensor->type));
 
+    ggml_cann_invalidate_nz(buf, (char*)tensor->data + offset, size);
     ACL_CHECK(aclrtMemcpyAsync((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE,
                                cann_ctx->stream()));
 }
@@ -2136,7 +2317,7 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
                                                ggml_tensor *       dst) {
     GGML_ASSERT(ggml_backend_is_cann(backend_src) || ggml_backend_is_cann(backend_dst));
 
-    GGML_ASSERT(!is_matmul_weight((const ggml_tensor *) src));
+    GGML_ASSERT(ggml_cann_nz_cache_enabled() || !is_matmul_weight((const ggml_tensor*)src));
 
     if (!ggml_backend_buft_is_cann(src->buffer->buft) || !ggml_backend_buft_is_cann(dst->buffer->buft)) {
         return false;
@@ -2148,6 +2329,7 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
     ggml_backend_cann_context * cann_ctx_src = (ggml_backend_cann_context *) backend_src->context;
     ggml_backend_cann_context * cann_ctx_dst = (ggml_backend_cann_context *) backend_dst->context;
 
+    ggml_cann_invalidate_nz(buf_dst, dst->data, ggml_nbytes(dst));
     size_t copy_size = ggml_nbytes(dst);
     if (copy_size == 0) {
         return true;
@@ -2306,10 +2488,13 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 
         if (cann_graph_capture_required) {  // End CANN graph capture
             ACL_CHECK(aclmdlRICaptureEnd(cann_ctx->stream(), &matched_graph->graph));
+            ++cann_ctx->acl_captures;
         }
 
         // Execute CANN graph
         ACL_CHECK(aclmdlRIExecuteAsync(matched_graph->graph, cann_ctx->stream()));
+        if (!cann_graph_capture_required)
+            ++cann_ctx->acl_replays;
     }
 #endif  // USE_ACL_GRAPH
 }
@@ -2337,6 +2522,14 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     bool graph_capture_required = false;
 #ifdef USE_ACL_GRAPH
     bool use_cann_graph = true;
+    // Captured operations retain the chosen ND/NZ pointer. A write, cache
+    // activation or buffer release must invalidate that pointer selection.
+    const uint64_t nz_epoch = g_nz_cache_epoch[cann_ctx->device].load();
+    if (cann_ctx->nz_cache_epoch != nz_epoch) {
+        ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
+        cann_ctx->graph_lru_cache.clear();
+        cann_ctx->nz_cache_epoch = nz_epoch;
+    }
 
     static bool prefill_use_graph = parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
     if (!prefill_use_graph) {
@@ -2439,6 +2632,12 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             break;
         case GGML_OP_MUL_MAT:
             {
+#ifdef ASCEND_310P
+                // 310P Cube rejects BF16 activations as well as BF16 weights.
+                if (op->src[1]->type == GGML_TYPE_BF16) {
+                    return false;
+                }
+#endif
                 switch (op->src[0]->type) {
 #ifndef ASCEND_310P
                     case GGML_TYPE_BF16:
@@ -2587,6 +2786,15 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 // value of paddingW should be at most half of kernelW
                 return (p0 <= (k0 / 2)) && (p1 <= (k1 / 2));
             }
+        case GGML_OP_ADD:
+#ifdef ASCEND_310P
+            // aclnnAdd on 310P does not accept BF16; allow scheduler fallback.
+            if (op->type == GGML_TYPE_BF16 || op->src[0]->type == GGML_TYPE_BF16 ||
+                op->src[1]->type == GGML_TYPE_BF16) {
+                return false;
+            }
+#endif
+            return true;
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_L2_NORM:
@@ -2601,7 +2809,6 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
         case GGML_OP_NORM:
-        case GGML_OP_ADD:
         case GGML_OP_ADD1:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
@@ -2978,8 +3185,14 @@ static ggml_backend_dev_t ggml_backend_cann_reg_get_device(ggml_backend_reg_t re
 
 static void * ggml_backend_cann_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-    GGML_UNUSED(name);
-    // reserved for future use
+    if (std::strcmp(name, "ggml_backend_cann_nz_cache_size") == 0)
+        return (void*)ggml_cann_nz_cache_size;
+    if (std::strcmp(name, "ggml_backend_cann_nz_cache_selections") == 0)
+        return (void*)ggml_cann_nz_cache_selections;
+    if (std::strcmp(name, "ggml_backend_cann_graph_captures") == 0)
+        return (void*)ggml_cann_graph_captures;
+    if (std::strcmp(name, "ggml_backend_cann_graph_replays") == 0)
+        return (void*)ggml_cann_graph_replays;
     return nullptr;
 }
 

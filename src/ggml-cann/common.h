@@ -526,6 +526,8 @@ struct ggml_cann_rope_cache {
     // sin/cos cache, used only to accelerate first layer on each device
     void *  sin_cache                  = nullptr;
     void *  cos_cache                  = nullptr;
+    // Allocated bytes are independent of the last operation's dimensions.
+    size_t sin_cos_cache_bytes = 0;
     // Properties to check before reusing the sincos cache
     int64_t theta_scale_length         = 0;
     int64_t position_length            = 0;
@@ -564,7 +566,11 @@ struct ggml_backend_cann_context {
     /// Cached CANN ACL graph used for executing the current ggml computation graph.
     ggml_cann_graph_lru_cache graph_lru_cache;
     bool                      acl_graph_mode = true;
+    uint64_t nz_cache_epoch = 0;
 #endif
+    // Always present: builds without ACL graph support report zero.
+    uint64_t acl_captures = 0;
+    uint64_t acl_replays = 0;
     bool                   async_mode;
     // Rope Cache
     ggml_cann_rope_cache   rope_cache;

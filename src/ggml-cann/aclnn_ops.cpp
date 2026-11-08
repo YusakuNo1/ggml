@@ -2224,7 +2224,14 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
 
     // Only check env once.
     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
-    if (weight_to_nz && weight->type != GGML_TYPE_BF16 && is_matmul_weight(weight)) {
+    void* cached = ggml_cann_cached_nz_weight(ctx, weight);
+    if (cached) {
+        ggml_tensor nz_tensor = *weight;
+        nz_tensor.data = cached;
+        acl_weight_tensor =
+            ggml_cann_create_tensor(&nz_tensor, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_FRACTAL_NZ);
+    } else if (!ggml_cann_nz_cache_enabled() && weight_to_nz && weight->type != GGML_TYPE_BF16 &&
+               is_matmul_weight(weight)) {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_FRACTAL_NZ);
     } else {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_ND);
@@ -2818,19 +2825,17 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
 
     // Step5: calculate sin cos.
     // init sin_repeat && cos_repeat, only to accelerate first layer on each device
-    if (position_length > ctx.rope_cache.position_length) {
-        ctx.rope_cache.position_length = position_length;
+    const size_t sin_cos_bytes = theta_scale_length * position_length * 2 * sizeof(float);
+    if (sin_cos_bytes > ctx.rope_cache.sin_cos_cache_bytes) {
         if (ctx.rope_cache.sin_cache != nullptr) {
             ACL_CHECK(aclrtFree(ctx.rope_cache.sin_cache));
         }
         if (ctx.rope_cache.cos_cache != nullptr) {
             ACL_CHECK(aclrtFree(ctx.rope_cache.cos_cache));
         }
-        int64_t repeat_theta_length = theta_scale_length * position_length * 2;
-        ACL_CHECK(
-            aclrtMalloc(&ctx.rope_cache.sin_cache, repeat_theta_length * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST));
-        ACL_CHECK(
-            aclrtMalloc(&ctx.rope_cache.cos_cache, repeat_theta_length * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST));
+        ACL_CHECK(aclrtMalloc(&ctx.rope_cache.sin_cache, sin_cos_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+        ACL_CHECK(aclrtMalloc(&ctx.rope_cache.cos_cache, sin_cos_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+        ctx.rope_cache.sin_cos_cache_bytes = sin_cos_bytes;
     }
 
     // sin/cos
